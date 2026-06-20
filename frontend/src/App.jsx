@@ -235,8 +235,6 @@ function IntroScreen({ onStart }) {
         {/* Divider */}
         <div style={{ height: 1, background: T.borderFaint, marginBottom: 56 }} />
 
-    
-
         {/* Process */}
         <div className="fade-up" style={{ animationDelay: "0.25s", marginBottom: 80 }}>
           <p style={{ fontSize: 11, fontWeight: 700, letterSpacing: "1.8px", color: T.textFaint, textTransform: "uppercase", marginBottom: 28 }}>Process</p>
@@ -343,11 +341,9 @@ function DoneScreen({ name }) {
    CHAT COMPONENTS
 ═══════════════════════════════════════════════════════════════════════════════ */
 
-/* Thinking dots — premium subtle animation */
 function ThinkingDots() {
   return (
     <div style={{ display: "flex", alignItems: "flex-end", gap: 10, marginBottom: 20, animation: "slideUp 0.25s ease both" }}>
-      {/* Bot mark */}
       <BotMark />
       <div style={{ display: "flex", gap: 5, padding: "13px 16px", background: T.surface, border: `1px solid ${T.border}`, borderRadius: "4px 16px 16px 16px" }}>
         {[0, 1, 2].map(i => (
@@ -358,7 +354,6 @@ function ThinkingDots() {
   );
 }
 
-/* Small bot identifier mark */
 function BotMark() {
   return (
     <div style={{ width: 28, height: 28, borderRadius: "50%", background: T.maroon, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginBottom: 2 }}>
@@ -370,7 +365,6 @@ function BotMark() {
   );
 }
 
-/* Message bubble */
 function Bubble({ msg }) {
   const isBot = msg.role === "bot";
   return (
@@ -396,7 +390,6 @@ function Bubble({ msg }) {
   );
 }
 
-/* Role picker cards */
 function RolePicker({ onSelect }) {
   const roles = [
     { id: "AI Engineering",  label: "AI Engineering",  sub: "LLMs, RAG, agents, voice AI, automation" },
@@ -422,7 +415,6 @@ function RolePicker({ onSelect }) {
   );
 }
 
-/* CV upload button */
 function CVUploadButton({ onUpload, loading }) {
   const ref = useRef();
   return (
@@ -447,13 +439,13 @@ function Spinner() {
    CHAT SCREEN
 ═══════════════════════════════════════════════════════════════════════════════ */
 function ChatScreen({ onDone, setDoneName }) {
-  const [messages,  setMessages]  = useState([]);
-  const [inputVal,  setInputVal]  = useState("");
-  const [isTyping,  setIsTyping]  = useState(false);
-  const [stage,     setStage]     = useState("name");
-  const [uiBlock,   setUiBlock]   = useState(null);
-  const [inputOff,  setInputOff]  = useState(false);
-  const [cvLoading, setCvLoading] = useState(false);
+  const [messages,   setMessages]   = useState([]);
+  const [inputVal,   setInputVal]   = useState("");
+  const [isTyping,   setIsTyping]   = useState(false);
+  const [stage,      setStage]      = useState("name");
+  const [uiBlock,    setUiBlock]    = useState(null);
+  const [inputOff,   setInputOff]   = useState(false);
+  const [cvLoading,  setCvLoading]  = useState(false);
   const [fieldError, setFieldError] = useState("");
 
   const bottomRef = useRef();
@@ -718,35 +710,63 @@ function ChatScreen({ onDone, setDoneName }) {
   };
   const ph = placeholders[stage] || "Type your answer…";
 
-  /* Progress indicator */
-  const STAGES = ["name","whatsapp","email","city","role","project","project_q","cv_upload","cv_q","ref_q","github","github_q"];
-  const progress = Math.round(((STAGES.indexOf(stage) + 1) / STAGES.length) * 100);
+  /* ─── Progress ───────────────────────────────────────────────────────────── */
+  const STAGES = [
+    { id: "name",      label: "Your name" },
+    { id: "whatsapp",  label: "WhatsApp number" },
+    { id: "email",     label: "Email address" },
+    { id: "city",      label: "Your city" },
+    { id: "role",      label: "Role selection" },
+    { id: "project",   label: "Project overview" },
+    { id: "project_q", label: "Project deep-dive" },
+    { id: "cv_upload", label: "CV upload" },
+    { id: "cv_q",      label: "CV questions" },
+    { id: "ref_q",     label: "General questions" },
+    { id: "github",    label: "GitHub / Portfolio" },
+    { id: "github_q",  label: "Final question" },
+  ];
+  const stageIndex = STAGES.findIndex(s => s.id === stage);
+  const progress   = Math.round(((stageIndex + 1) / STAGES.length) * 100);
+  const stageLabel = STAGES[stageIndex]?.label ?? "";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", background: T.bg }}>
       <style>{GLOBAL_CSS}</style>
 
+      {/* ── Top progress bar — full width, no border-radius, sits above header ── */}
+      <div style={{ position: "relative", height: 3, background: T.border, flexShrink: 0 }}>
+        <div style={{
+          position: "absolute", left: 0, top: 0, height: "100%",
+          width: `${progress}%`,
+          background: T.maroon,
+          transition: "width 0.45s cubic-bezier(0.4,0,0.2,1)",
+        }} />
+      </div>
+
       {/* Header */}
       <div style={{ borderBottom: `1px solid ${T.borderFaint}`, padding: "14px 24px", display: "flex", alignItems: "center", gap: 14, flexShrink: 0 }}>
         <Logo size={14} />
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 16 }}>
           {/* Live indicator */}
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <span style={{ width: 6, height: 6, borderRadius: "50%", background: T.green, display: "inline-block", animation: "pulse 2.5s ease infinite" }} />
             <span style={{ fontSize: 12, color: T.textMid, fontWeight: 500 }}>AI Screener</span>
           </div>
-          {/* Progress */}
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <div style={{ width: 72, height: 3, background: T.border, borderRadius: 3, overflow: "hidden" }}>
-              <div style={{ height: "100%", width: `${progress}%`, background: T.maroon, borderRadius: 3, transition: "width 0.4s ease" }} />
-            </div>
-            <span style={{ fontSize: 11, color: T.textFaint, fontWeight: 600 }}>{progress}%</span>
+          {/* Step label + % */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 11, color: T.textFaint, fontWeight: 500 }}>
+              Step {stageIndex + 1}/{STAGES.length}
+            </span>
+            <span style={{ width: 1, height: 10, background: T.border, display: "inline-block" }} />
+            <span style={{ fontSize: 11, color: T.textMid, fontWeight: 500 }}>{stageLabel}</span>
+            <span style={{ width: 1, height: 10, background: T.border, display: "inline-block" }} />
+            <span style={{ fontSize: 11, color: T.maroon, fontWeight: 700 }}>{progress}%</span>
           </div>
         </div>
       </div>
 
       {/* Messages */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "32px 20px 16px", maxWidth: 680, width: "100%", margin: "0 auto", display: "flex", flexDirection: "column", width: "100%" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "32px 20px 16px", maxWidth: 680, width: "100%", margin: "0 auto", display: "flex", flexDirection: "column" }}>
         {messages.map((m, i) => <Bubble key={i} msg={m} />)}
         {isTyping && <ThinkingDots />}
         {!isTyping && uiBlock === "roles" && <RolePicker onSelect={handleRoleSelect} />}
@@ -758,7 +778,6 @@ function ChatScreen({ onDone, setDoneName }) {
       <div style={{ borderTop: `1px solid ${T.borderFaint}`, padding: "12px 20px 16px", background: T.bg, flexShrink: 0 }}>
         <div style={{ maxWidth: 680, margin: "0 auto" }}>
 
-          {/* Inline validation error */}
           {fieldError && (
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, padding: "9px 14px", background: "rgba(155,29,58,0.08)", border: `1px solid ${T.maroonDim}`, borderRadius: 8, animation: "slideUp 0.2s ease both" }}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" style={{ flexShrink: 0 }}>
