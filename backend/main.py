@@ -3,7 +3,8 @@ CodeCelix AI Screener — FastAPI Backend
 Groq llama-3.1-8b-instant for fast question generation
 Anthropic claude-sonnet-4-6 for final scoring only
 """
-
+import re
+import json
 import os, json, uuid, tempfile
 from datetime import datetime, timezone
 from typing import Optional
@@ -20,7 +21,6 @@ load_dotenv()
 
 # ── Clients ───────────────────────────────────────────────────────────────────
 groq_client   = Groq(api_key=os.environ["GROQ_API_KEY"])
-claude_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 supabase: Client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
 app = FastAPI(title="CodeCelix Screener API")
@@ -87,7 +87,14 @@ def validate_field(req: ValidateRequest):
         ok = validate_github(req.value)
         return {"valid": ok, "message": "" if ok else "Please enter a valid URL or portfolio link."}
     return {"valid": True, "message": ""}
-
+def safe_json_load(raw: str):
+    try:
+        return json.loads(raw)
+    except:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        raise
 # ── Groq fast call ────────────────────────────────────────────────────────────
 def groq(prompt: str, system: str = "", max_tokens: int = 600) -> str:
     msgs = []
@@ -103,14 +110,24 @@ def groq(prompt: str, system: str = "", max_tokens: int = 600) -> str:
     return resp.choices[0].message.content.strip()
 
 # ── Claude scoring call ───────────────────────────────────────────────────────
-def claude_score(prompt: str) -> str:
-    resp = claude_client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1000,
-        messages=[{"role": "user", "content": prompt}],
+def groq_score(prompt: str) -> str:
+    resp = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a strict JSON-only recruiter API. Return ONLY valid JSON. No explanation. No markdown."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0.6,
+        top_p=0.9,
+        max_tokens=1200
     )
-    return resp.content[0].text.strip()
-
+    return resp.choices[0].message.content.strip()
 # ── CV extraction ─────────────────────────────────────────────────────────────
 def extract_cv(path: str, filename: str) -> str:
     ext = filename.lower().split(".")[-1]
@@ -303,7 +320,6 @@ def submit(data: SubmitRequest):
     app_id = str(uuid.uuid4())
     submitted_at = datetime.now(timezone.utc).isoformat()
 
-    # Build readable transcript
     lines = [
         f"CodeCelix Screener — {data.personal.name} — {data.role}",
         f"Submitted: {submitted_at}", "",
@@ -311,40 +327,66 @@ def submit(data: SubmitRequest):
         "=== PROJECT ===",
         f"A: {data.project_qa.answer}", "",
     ]
+
     for fu in data.project_qa.followups:
         lines += [f"Q: {fu.question}", f"A: {fu.answer}", ""]
+
     lines.append("=== CV QUESTIONS ===")
     for qa in data.cv_qa:
         lines += [f"Q: {qa.question}", f"A: {qa.answer}", ""]
+
     lines.append("=== REFERENCE QUESTIONS ===")
     for qa in data.ref_qa:
         lines += [f"Q: {qa.question}", f"A: {qa.answer}", ""]
-    lines += ["=== GITHUB ===", f"Link: {data.github}", f"Q: {data.github_qa.question}", f"A: {data.github_qa.answer}"]
+
+    lines += [
+        "=== GITHUB ===",
+        f"Link: {data.github}",
+        f"Q: {data.github_qa.question}",
+        f"A: {data.github_qa.answer}"
+    ]
+
     transcript_text = "\n".join(lines)
 
-    # Claude scores
-    score_prompt = f"""You are a senior technical recruiter at CodeCelix evaluating a {data.role} candidate.
+    score_prompt = f"""
+You are a senior technical recruiter at CodeCelix evaluating a {data.role} candidate.
 
+EVALUATION RULES:
+- Be strict and realistic
+- Weak answers → low score
+- Strong answers → high score
+- Consider technical depth, clarity, and problem solving
+
+TRANSCRIPT:
 {transcript_text}
 
-Score and evaluate. Respond ONLY with JSON (no markdown):
-{{
-  "score": <0-100>,
-  "grade": "<A/B/C/D>",
-  "verdict": "<Hire/Maybe/Reject>",
-  "strengths": ["...", "..."],
-  "concerns": ["...", "..."],
-  "summary": "<2-3 sentences>",
-  "next_step": "<what to do next>"
-}}
+Return ONLY valid JSON:
 
-Scoring: 80-100 strong hire, 60-79 promising, 40-59 junior/gaps, 0-39 not a fit."""
+{{
+  "score": 0,
+  "grade": "A/B/C/D",
+  "verdict": "Hire/Maybe/Reject",
+  "strengths": [],
+  "concerns": [],
+  "summary": "2-3 sentence evaluation",
+  "next_step": "actionable advice"
+}}
+"""
 
     try:
-        raw = claude_score(score_prompt)
-        report = json.loads(raw)
-    except:
-        report = {"score": 50, "grade": "C", "verdict": "Maybe", "strengths": [], "concerns": ["Auto-score failed — review manually"], "summary": "Manual review required.", "next_step": "Review transcript manually."}
+        raw = groq_score(score_prompt)
+        report = safe_json_load(raw)
+    except Exception as e:
+        print("[SCORING ERROR]", e)
+        report = {
+            "score": -1,
+            "grade": "ERROR",
+            "verdict": "Parse Failed",
+            "strengths": [],
+            "concerns": ["Model JSON invalid or parsing failed"],
+            "summary": "System error during scoring.",
+            "next_step": "Check Groq output format"
+        }
 
     row = {
         "id": app_id,
@@ -363,7 +405,7 @@ Scoring: 80-100 strong hire, 60-79 promising, 40-59 junior/gaps, 0-39 not a fit.
         "summary": report.get("summary"),
         "recommended_next_step": report.get("next_step"),
         "transcript": transcript_text,
-        "full_report": json.dumps(report),
+        "full_report": report
     }
 
     try:
