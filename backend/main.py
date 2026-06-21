@@ -26,6 +26,10 @@ supabase: Client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABAS
 app = FastAPI(title="CodeCelix Screener API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ── Email scheduler (runs daily at 09:00 UTC) ─────────────────────────────────
+from scheduler import start_scheduler
+start_scheduler()
+
 # ── Reference question themes — Groq uses these as INSPIRATION, not copy ─────
 REFERENCE_THEMES = {
   "AI Engineering": [
