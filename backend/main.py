@@ -17,12 +17,12 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
 from functools import lru_cache
+from fastapi import FastAPI
 
-from dotenv import load_dotenv
 from groq import Groq
 from supabase import create_client, Client
 
-load_dotenv()
+
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -32,6 +32,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+app = FastAPI()
 # ── Required env vars — checked at runtime, not import time ───────────────────
 REQUIRED_VARS = [
     "GROQ_API_KEY",
