@@ -2,12 +2,11 @@
 automation.py
 ─────────────
 Fetches shortlisted candidates from Supabase,
-generates an AI feedback block via Groq,
-sends a branded HTML email via Gmail SMTP (free),
-then marks email_sent = true.
+generates AI feedback via Groq,
+sends branded HTML email via Gmail SMTP,
+marks email_sent = true.
 
-Called by scheduler.py on a daily cron.
-Can also be run manually: python automation.py
+Railway-safe: no module-level client init.
 """
 
 import os
@@ -17,6 +16,7 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
+from functools import lru_cache
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -32,22 +32,45 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Clients ────────────────────────────────────────────────────────────────────
-groq_client: Groq   = Groq(api_key=os.environ["GROQ_API_KEY"])
-supabase:    Client = create_client(
-    os.environ["SUPABASE_URL"],
-    os.environ["SUPABASE_SERVICE_KEY"],
-)
+# ── Required env vars — checked at runtime, not import time ───────────────────
+REQUIRED_VARS = [
+    "GROQ_API_KEY",
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_KEY",
+    "GMAIL_USER",
+    "GMAIL_APP_PASS",
+]
 
-# Gmail credentials (use an App Password, not your real password)
-GMAIL_USER     = os.environ["GMAIL_USER"]       # e.g. yourname@gmail.com
-GMAIL_APP_PASS = os.environ["GMAIL_APP_PASS"]   # 16-char App Password
+def check_env() -> None:
+    missing = [v for v in REQUIRED_VARS if not os.getenv(v)]
+    if missing:
+        raise RuntimeError(f"[automation] Missing env vars: {', '.join(missing)}")
+
+
+# ── Lazy clients (created once on first use, not at import) ───────────────────
+@lru_cache(maxsize=1)
+def get_groq() -> Groq:
+    return Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+@lru_cache(maxsize=1)
+def get_supabase() -> Client:
+    return create_client(
+        os.getenv("SUPABASE_URL"),
+        os.getenv("SUPABASE_SERVICE_KEY"),
+    )
+
+def gmail_user() -> str:
+    return os.getenv("GMAIL_USER", "")
+
+def gmail_pass() -> str:
+    return os.getenv("GMAIL_APP_PASS", "")
 
 
 # ── Step 1: Fetch candidates ───────────────────────────────────────────────────
 def fetch_shortlisted() -> list[dict]:
     result = (
-        supabase.table("applications")
+        get_supabase()
+        .table("applications")
         .select(
             "id, name, email, role, score, grade, verdict, "
             "strengths, concerns, summary, recommended_next_step"
@@ -62,7 +85,7 @@ def fetch_shortlisted() -> list[dict]:
     return candidates
 
 
-# ── Step 2: Generate AI feedback block via Groq ───────────────────────────────
+# ── Step 2: Generate AI feedback via Groq ─────────────────────────────────────
 FEEDBACK_PROMPT = """You are a professional technical recruiter writing candidate feedback for CodeCelix.
 
 Use ONLY the data provided below. Do NOT invent facts. Do NOT add generic motivational filler.
@@ -105,21 +128,20 @@ def generate_ai_feedback(candidate: dict) -> dict:
         recommended_next_step=candidate.get("recommended_next_step") or "Not recorded.",
     )
     try:
-        resp = groq_client.chat.completions.create(
+        resp = get_groq().chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.4,
             max_tokens=600,
         )
         raw = resp.choices[0].message.content.strip()
-        # Strip markdown fences if model adds them
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
         return json.loads(raw.strip())
     except Exception as e:
-        log.warning(f"Groq fallback for {candidate['name']}: {e}")
+        log.warning(f"Groq fallback for {candidate.get('name', '?')}: {e}")
         return {
             "candidate_summary": candidate.get("summary") or "Evaluation completed.",
             "key_strengths": candidate.get("strengths") or [],
@@ -128,17 +150,12 @@ def generate_ai_feedback(candidate: dict) -> dict:
         }
 
 
-# ── Step 3: Render AI feedback as HTML fragment ───────────────────────────────
+# ── Step 3: Render feedback as HTML ───────────────────────────────────────────
 def render_feedback_html(fb: dict) -> str:
-    strengths_html = "".join(
-        f"<li>{s}</li>" for s in (fb.get("key_strengths") or [])
-    )
-    improvements_html = "".join(
-        f"<li>{a}</li>" for a in (fb.get("areas_for_improvement") or [])
-    )
+    strengths_html    = "".join(f"<li>{s}</li>" for s in (fb.get("key_strengths") or []))
+    improvements_html = "".join(f"<li>{a}</li>" for a in (fb.get("areas_for_improvement") or []))
     rec = fb.get("personalized_recommendation", "")
     rec_html = f'<p class="ai-recommendation">{rec}</p>' if rec else ""
-
     return f"""
 <p class="ai-summary">{fb.get("candidate_summary", "")}</p>
 <p class="ai-section-title">Key Strengths</p>
@@ -153,13 +170,13 @@ def send_email(to_email: str, subject: str, html_body: str) -> bool:
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
-        msg["From"]    = f"CodeCelix Careers <{GMAIL_USER}>"
+        msg["From"]    = f"CodeCelix Careers <{gmail_user()}>"
         msg["To"]      = to_email
         msg.attach(MIMEText(html_body, "html"))
 
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(GMAIL_USER, GMAIL_APP_PASS)
-            smtp.sendmail(GMAIL_USER, to_email, msg.as_string())
+            smtp.login(gmail_user(), gmail_pass())
+            smtp.sendmail(gmail_user(), to_email, msg.as_string())
 
         log.info(f"  ✓ Sent → {to_email}")
         return True
@@ -170,12 +187,19 @@ def send_email(to_email: str, subject: str, html_body: str) -> bool:
 
 # ── Step 5: Mark email_sent = true ────────────────────────────────────────────
 def mark_sent(candidate_id: str) -> None:
-    supabase.table("applications").update({"email_sent": True}).eq("id", candidate_id).execute()
+    try:
+        get_supabase().table("applications").update(
+            {"email_sent": True}
+        ).eq("id", candidate_id).execute()
+    except Exception as e:
+        log.error(f"  ✗ mark_sent failed for {candidate_id}: {e}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def run() -> None:
     from email_template import build_email
+
+    check_env()  # ← fails loud + clear if anything missing
 
     log.info("=" * 55)
     log.info(f"CodeCelix Email Automation — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
@@ -185,15 +209,19 @@ def run() -> None:
     sent, failed = 0, 0
 
     for c in candidates:
-        log.info(f"Processing: {c['name']}")
-        feedback      = generate_ai_feedback(c)
-        ai_html       = render_feedback_html(feedback)
-        subject, html = build_email(c, ai_html)
-        success       = send_email(c["email"], subject, html)
-        if success:
-            mark_sent(c["id"])
-            sent += 1
-        else:
+        log.info(f"Processing: {c.get('name', '?')}")
+        try:
+            feedback      = generate_ai_feedback(c)
+            ai_html       = render_feedback_html(feedback)
+            subject, html = build_email(c, ai_html)
+            success       = send_email(c["email"], subject, html)
+            if success:
+                mark_sent(c["id"])
+                sent += 1
+            else:
+                failed += 1
+        except Exception as e:
+            log.error(f"  ✗ Skipped {c.get('name', '?')}: {e}")
             failed += 1
 
     log.info(f"Done. Sent: {sent}  Failed: {failed}")
