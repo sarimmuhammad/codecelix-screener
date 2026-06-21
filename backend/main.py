@@ -1,234 +1,419 @@
 """
-automation.py
-─────────────
-Fetches shortlisted candidates from Supabase,
-generates AI feedback via Groq,
-sends branded HTML email via Gmail SMTP,
-marks email_sent = true.
-
-Railway-safe: no module-level client init.
+CodeCelix AI Screener — FastAPI Backend
+Groq llama-3.1-8b-instant for fast question generation
+Anthropic claude-sonnet-4-6 for final scoring only
 """
-
-import os
+import re
 import json
-import logging
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import os, json, uuid, tempfile
 from datetime import datetime, timezone
-from functools import lru_cache
-from fastapi import FastAPI
-
+from typing import Optional
 from groq import Groq
+import pdfplumber
+import docx2txt
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from supabase import create_client, Client
 
 
 
-# ── Logging ────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
+# ── Clients ───────────────────────────────────────────────────────────────────
+groq_client   = Groq(api_key=os.environ["GROQ_API_KEY"])
+supabase: Client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
+app = FastAPI(title="CodeCelix Screener API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-app = FastAPI()
-# ── Required env vars — checked at runtime, not import time ───────────────────
-REQUIRED_VARS = [
-    "GROQ_API_KEY",
-    "SUPABASE_URL",
-    "SUPABASE_SERVICE_KEY",
-    "GMAIL_USER",
-    "GMAIL_APP_PASS",
-]
+# ── Email scheduler (runs daily at 09:00 UTC) ─────────────────────────────────
+from scheduler import start_scheduler
+start_scheduler()
 
-def check_env() -> None:
-    missing = [v for v in REQUIRED_VARS if not os.getenv(v)]
-    if missing:
-        raise RuntimeError(f"[automation] Missing env vars: {', '.join(missing)}")
+# ── Reference question themes — Groq uses these as INSPIRATION, not copy ─────
+REFERENCE_THEMES = {
+  "AI Engineering": [
+    "How candidate handles retrieval systems (vector DBs, chunking, search quality)",
+    "How candidate approaches low-latency real-time AI pipelines (voice/streaming)",
+    "How candidate debugs non-deterministic AI failures in production",
+    "How candidate scopes and delivers an end-to-end AI automation for a client",
+  ],
+  "Web Development": [
+    "How candidate architects scalable APIs and handles high traffic",
+    "How candidate approaches debugging hard-to-reproduce production issues",
+    "How candidate manages client projects from kickoff to delivery",
+    "How candidate makes build-vs-buy decisions on a solo or small team",
+  ],
+  "UI/UX Design": [
+    "How candidate approaches design with zero user research available",
+    "How candidate handles developer pushback on design feasibility",
+    "How candidate designs for non-technical or first-time digital users",
+    "How candidate manages design handoffs and design system consistency",
+  ],
+}
 
+# ── Validation helpers ────────────────────────────────────────────────────────
+def validate_phone(phone: str) -> bool:
+    """Exactly 11 digits (digits only after stripping spaces/dashes)."""
+    digits = "".join(c for c in phone if c.isdigit())
+    return len(digits) == 11
 
-# ── Lazy clients (created once on first use, not at import) ───────────────────
-@lru_cache(maxsize=1)
-def get_groq() -> Groq:
-    return Groq(api_key=os.getenv("GROQ_API_KEY"))
+def validate_email(email: str) -> bool:
+    """Must contain @ and a dot after the @."""
+    if "@" not in email:
+        return False
+    local, _, domain = email.partition("@")
+    return bool(local) and "." in domain and not domain.startswith(".") and not domain.endswith(".")
 
-@lru_cache(maxsize=1)
-def get_supabase() -> Client:
-    return create_client(
-        os.getenv("SUPABASE_URL"),
-        os.getenv("SUPABASE_SERVICE_KEY"),
+def validate_github(url: str) -> bool:
+    """Must be a recognisable URL (http/https) or at least contain a dot."""
+    url = url.strip()
+    if url.startswith("http://") or url.startswith("https://"):
+        return True
+    # allow plain domains like github.com/username or behance.net/...
+    return "." in url and len(url) > 4
+
+# ── Validation endpoint ───────────────────────────────────────────────────────
+class ValidateRequest(BaseModel):
+    field: str   # "phone" | "email" | "github"
+    value: str
+
+@app.post("/validate")
+def validate_field(req: ValidateRequest):
+    field = req.field.lower()
+    if field == "phone":
+        ok = validate_phone(req.value)
+        return {"valid": ok, "message": "" if ok else "Phone number must be exactly 11 digits."}
+    elif field == "email":
+        ok = validate_email(req.value)
+        return {"valid": ok, "message": "" if ok else "Please enter a valid email address (e.g. you@example.com)."}
+    elif field == "github":
+        ok = validate_github(req.value)
+        return {"valid": ok, "message": "" if ok else "Please enter a valid URL or portfolio link."}
+    return {"valid": True, "message": ""}
+def safe_json_load(raw: str):
+    try:
+        return json.loads(raw)
+    except:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        raise
+# ── Groq fast call ────────────────────────────────────────────────────────────
+def groq(prompt: str, system: str = "", max_tokens: int = 600) -> str:
+    msgs = []
+    if system:
+        msgs.append({"role": "system", "content": system})
+    msgs.append({"role": "user", "content": prompt})
+    resp = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=msgs,
+        max_tokens=max_tokens,
+        temperature=0.7,
     )
+    return resp.choices[0].message.content.strip()
 
-def gmail_user() -> str:
-    return os.getenv("GMAIL_USER", "")
-
-def gmail_pass() -> str:
-    return os.getenv("GMAIL_APP_PASS", "")
-
-
-# ── Step 1: Fetch candidates ───────────────────────────────────────────────────
-def fetch_shortlisted() -> list[dict]:
-    result = (
-        get_supabase()
-        .table("applications")
-        .select(
-            "id, name, email, role, score, grade, verdict, "
-            "strengths, concerns, summary, recommended_next_step"
-        )
-        .eq("shortlisted", True)
-        .eq("email_sent", False)
-        .order("submitted_at", desc=True)
-        .execute()
+# ── Claude scoring call ───────────────────────────────────────────────────────
+def groq_score(prompt: str) -> str:
+    resp = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a strict JSON-only recruiter API. Return ONLY valid JSON. No explanation. No markdown."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0.6,
+        top_p=0.9,
+        max_tokens=1200
     )
-    candidates = result.data or []
-    log.info(f"Found {len(candidates)} candidate(s) to email.")
-    return candidates
+    return resp.choices[0].message.content.strip()
+# ── CV extraction ─────────────────────────────────────────────────────────────
+def extract_cv(path: str, filename: str) -> str:
+    ext = filename.lower().split(".")[-1]
+    text = ""
+    if ext == "pdf":
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t: text += t + "\n"
+    elif ext in ("doc", "docx"):
+        text = docx2txt.process(path)
+    return text.strip()[:6000]
+
+# ── Models ────────────────────────────────────────────────────────────────────
+class ProjectQRequest(BaseModel):
+    role: str
+    project_answer: str
+
+class CVQuestionRequest(BaseModel):
+    role: str
+    project_answer: str
+    cv_text: str
+
+class GithubQRequest(BaseModel):
+    role: str
+    github_url: str
+    name: str
+
+class PersonalInfo(BaseModel):
+    name: str; whatsapp: str; email: str; city: str
+
+class QA(BaseModel):
+    question: str; answer: str
+
+class ProjectQA(BaseModel):
+    answer: str
+    followups: list[QA]
+
+class SubmitRequest(BaseModel):
+    personal: PersonalInfo
+    role: str
+    project_qa: ProjectQA
+    cv_text: str
+    cv_qa: list[QA]
+    ref_qa: list[QA]
+    github: str
+    github_qa: QA
+    transcript: list[dict]
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    return {"status": "CodeCelix Screener API ✅"}
 
 
-# ── Step 2: Generate AI feedback via Groq ─────────────────────────────────────
-FEEDBACK_PROMPT = """You are a professional technical recruiter writing candidate feedback for CodeCelix.
+@app.post("/generate-project-questions")
+def generate_project_questions(req: ProjectQRequest):
+    prompt = f"""You are a senior technical interviewer at CodeCelix hiring for {req.role}.
 
-Use ONLY the data provided below. Do NOT invent facts. Do NOT add generic motivational filler.
-Do NOT write exaggerated praise. Be concise, honest, and professional.
+A candidate described their most complex project:
+\"\"\"{req.project_answer}\"\"\"
 
-Candidate data:
-- Role: {role}
-- Score: {score}/100
-- Grade: {grade}
-- Verdict: {verdict}
-- Strengths: {strengths}
-- Concerns: {concerns}
-- Summary: {summary}
-- Recommended next step: {recommended_next_step}
+Generate exactly 2 sharp follow-up questions that:
+- Dig into specific technical claims or decisions they actually mentioned
+- Reveal depth of understanding (not just surface knowledge)
+- Are conversational, 1-2 sentences each
+- Do NOT ask generic questions — reference something specific from their answer
 
-Return ONLY a JSON object with exactly these four fields:
-{{
-  "candidate_summary": "2-3 sentences summarizing the candidate based strictly on their evaluation.",
-  "key_strengths": ["strength 1", "strength 2", "strength 3"],
-  "areas_for_improvement": ["area 1", "area 2"],
-  "personalized_recommendation": "1-2 sentences of honest, specific advice for their technical interview."
-}}
+Respond ONLY with a JSON array of 2 strings. No markdown, no backticks:
+["question 1", "question 2"]"""
+
+    raw = groq(prompt)
+    try:
+        qs = json.loads(raw)
+        if not isinstance(qs, list) or len(qs) < 2:
+            raise ValueError
+    except:
+        qs = [
+            "What was the single hardest technical decision you made in that project, and what alternatives did you consider?",
+            "If you had to rebuild it from scratch today, what would you do completely differently and why?",
+        ]
+    return {"questions": qs}
+
+
+@app.post("/generate-ref-questions")
+def generate_ref_questions(req: CVQuestionRequest):
+    themes = REFERENCE_THEMES.get(req.role, REFERENCE_THEMES["AI Engineering"])
+    themes_text = "\n".join(f"- {t}" for t in themes)
+
+    prompt = f"""You are a senior technical interviewer at CodeCelix hiring for {req.role}.
+
+Here is what you know about the candidate so far:
+
+PROJECT THEY DESCRIBED:
+{req.project_answer[:800]}
+
+CV SUMMARY:
+{req.cv_text[:1200] if req.cv_text else "Not available"}
+
+Your goal is to generate exactly 2 interview questions. Use these THEMES as inspiration for what to probe — but make each question specific to THIS candidate based on what you know about them:
+
+THEMES TO EXPLORE:
+{themes_text}
 
 Rules:
-- Pull strengths directly from the strengths array, rephrase naturally, max 3 items
-- Pull improvements from concerns array, phrase constructively, max 2 items
-- Recommendation must be specific to their role and actual concerns — not generic
-- Return ONLY valid JSON. No markdown. No explanation. No backticks."""
+- Reference something real from their background if possible
+- Questions should feel natural in a conversation, not like a form
+- 1-2 sentences each
+- Reveal actual skill depth, not just surface answers
 
+Respond ONLY with a JSON array of 2 strings. No markdown, no backticks:
+["question 1", "question 2"]"""
 
-def generate_ai_feedback(candidate: dict) -> dict:
-    prompt = FEEDBACK_PROMPT.format(
-        role=candidate.get("role", "the applied role"),
-        score=candidate.get("score", "N/A"),
-        grade=candidate.get("grade", "N/A"),
-        verdict=candidate.get("verdict", "N/A"),
-        strengths=json.dumps(candidate.get("strengths") or []),
-        concerns=json.dumps(candidate.get("concerns") or []),
-        summary=candidate.get("summary") or "No summary available.",
-        recommended_next_step=candidate.get("recommended_next_step") or "Not recorded.",
-    )
+    raw = groq(prompt)
     try:
-        resp = get_groq().chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.4,
-            max_tokens=600,
-        )
-        raw = resp.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        return json.loads(raw.strip())
+        qs = json.loads(raw)
+        if not isinstance(qs, list) or len(qs) < 2:
+            raise ValueError
+    except:
+        qs = [
+            "How do you decide what to build yourself versus use an existing tool or API?",
+            "Walk me through how you'd scope and kick off a new client project in your first week.",
+        ]
+    return {"questions": qs}
+
+
+@app.post("/upload-cv")
+async def upload_cv(file: UploadFile = File(...)):
+    ext = file.filename.lower().split(".")[-1]
+    if ext not in {"pdf", "doc", "docx"}:
+        raise HTTPException(400, "Only PDF or Word files accepted.")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    try:
+        cv_text = extract_cv(tmp_path, file.filename)
+    finally:
+        os.unlink(tmp_path)
+
+    if not cv_text:
+        return {"cv_text": "", "questions": [
+            "Walk me through your most recent role and what you actually built.",
+            "Which experience on your CV pushed your technical skills the most?",
+        ]}
+
+    prompt = f"""You are a technical interviewer at CodeCelix reviewing this CV:
+
+{cv_text}
+
+Generate exactly 2 interview questions that:
+- Reference something SPECIFIC from this CV (a company name, project, or technology actually mentioned)
+- Are technical or experience-focused
+- Sound like a recruiter who actually read it carefully
+
+Respond ONLY with a JSON array of 2 strings. No markdown, no backticks:
+["question 1", "question 2"]"""
+
+    raw = groq(prompt)
+    try:
+        qs = json.loads(raw)
+        if not isinstance(qs, list) or len(qs) < 2:
+            raise ValueError
+    except:
+        qs = [
+            "Walk me through your most impactful project from your CV and the key technical decisions you made.",
+            "You've worked across multiple roles — what's the biggest technical skill you picked up that wasn't in your job description?",
+        ]
+    return {"cv_text": cv_text, "questions": qs}
+
+
+@app.post("/generate-github-question")
+def generate_github_question(req: GithubQRequest):
+    prompt = f"""You are a technical recruiter at CodeCelix interviewing {req.name} for {req.role}.
+
+They shared: {req.github_url}
+
+Write ONE question (1-2 sentences) that asks them to highlight their best or most technically interesting work from their GitHub or portfolio. Make it feel natural and specific to a {req.role} candidate.
+
+Reply with ONLY the question, no intro."""
+
+    q = groq(prompt, max_tokens=150)
+    return {"question": q}
+
+
+@app.post("/submit")
+def submit(data: SubmitRequest):
+    app_id = str(uuid.uuid4())
+    submitted_at = datetime.now(timezone.utc).isoformat()
+
+    lines = [
+        f"CodeCelix Screener — {data.personal.name} — {data.role}",
+        f"Submitted: {submitted_at}", "",
+        f"CONTACT: {data.personal.whatsapp} | {data.personal.email} | {data.personal.city}", "",
+        "=== PROJECT ===",
+        f"A: {data.project_qa.answer}", "",
+    ]
+
+    for fu in data.project_qa.followups:
+        lines += [f"Q: {fu.question}", f"A: {fu.answer}", ""]
+
+    lines.append("=== CV QUESTIONS ===")
+    for qa in data.cv_qa:
+        lines += [f"Q: {qa.question}", f"A: {qa.answer}", ""]
+
+    lines.append("=== REFERENCE QUESTIONS ===")
+    for qa in data.ref_qa:
+        lines += [f"Q: {qa.question}", f"A: {qa.answer}", ""]
+
+    lines += [
+        "=== GITHUB ===",
+        f"Link: {data.github}",
+        f"Q: {data.github_qa.question}",
+        f"A: {data.github_qa.answer}"
+    ]
+
+    transcript_text = "\n".join(lines)
+
+    score_prompt = f"""
+You are a senior technical recruiter at CodeCelix evaluating a {data.role} candidate.
+
+EVALUATION RULES:
+- Be strict and realistic
+- Weak answers → low score
+- Strong answers → high score
+- Consider technical depth, clarity, and problem solving
+
+TRANSCRIPT:
+{transcript_text}
+
+Return ONLY valid JSON:
+
+{{
+  "score": 0,
+  "grade": "A/B/C/D",
+  "verdict": "Hire/Maybe/Reject",
+  "strengths": [],
+  "concerns": [],
+  "summary": "2-3 sentence evaluation",
+  "next_step": "actionable advice"
+}}
+"""
+
+    try:
+        raw = groq_score(score_prompt)
+        report = safe_json_load(raw)
     except Exception as e:
-        log.warning(f"Groq fallback for {candidate.get('name', '?')}: {e}")
-        return {
-            "candidate_summary": candidate.get("summary") or "Evaluation completed.",
-            "key_strengths": candidate.get("strengths") or [],
-            "areas_for_improvement": candidate.get("concerns") or [],
-            "personalized_recommendation": candidate.get("recommended_next_step") or "",
+        print("[SCORING ERROR]", e)
+        report = {
+            "score": -1,
+            "grade": "ERROR",
+            "verdict": "Parse Failed",
+            "strengths": [],
+            "concerns": ["Model JSON invalid or parsing failed"],
+            "summary": "System error during scoring.",
+            "next_step": "Check Groq output format"
         }
 
+    row = {
+        "id": app_id,
+        "submitted_at": submitted_at,
+        "name": data.personal.name,
+        "email": data.personal.email,
+        "whatsapp": data.personal.whatsapp,
+        "city": data.personal.city,
+        "role": data.role,
+        "github": data.github,
+        "score": report.get("score"),
+        "grade": report.get("grade"),
+        "verdict": report.get("verdict"),
+        "strengths": report.get("strengths"),
+        "concerns": report.get("concerns"),
+        "summary": report.get("summary"),
+        "recommended_next_step": report.get("next_step"),
+        "transcript": transcript_text,
+        "full_report": report
+    }
 
-# ── Step 3: Render feedback as HTML ───────────────────────────────────────────
-def render_feedback_html(fb: dict) -> str:
-    strengths_html    = "".join(f"<li>{s}</li>" for s in (fb.get("key_strengths") or []))
-    improvements_html = "".join(f"<li>{a}</li>" for a in (fb.get("areas_for_improvement") or []))
-    rec = fb.get("personalized_recommendation", "")
-    rec_html = f'<p class="ai-recommendation">{rec}</p>' if rec else ""
-    return f"""
-<p class="ai-summary">{fb.get("candidate_summary", "")}</p>
-<p class="ai-section-title">Key Strengths</p>
-<ul>{strengths_html}</ul>
-<p class="ai-section-title">Areas to Develop</p>
-<ul>{improvements_html}</ul>
-{rec_html}"""
-
-
-# ── Step 4: Send via Gmail SMTP ───────────────────────────────────────────────
-def send_email(to_email: str, subject: str, html_body: str) -> bool:
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = f"CodeCelix Careers <{gmail_user()}>"
-        msg["To"]      = to_email
-        msg.attach(MIMEText(html_body, "html"))
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(gmail_user(), gmail_pass())
-            smtp.sendmail(gmail_user(), to_email, msg.as_string())
-
-        log.info(f"  ✓ Sent → {to_email}")
-        return True
+        supabase.table("applications").insert(row).execute()
     except Exception as e:
-        log.error(f"  ✗ Failed → {to_email}: {e}")
-        return False
+        print(f"[Supabase error] {e}")
 
-
-# ── Step 5: Mark email_sent = true ────────────────────────────────────────────
-def mark_sent(candidate_id: str) -> None:
-    try:
-        get_supabase().table("applications").update(
-            {"email_sent": True}
-        ).eq("id", candidate_id).execute()
-    except Exception as e:
-        log.error(f"  ✗ mark_sent failed for {candidate_id}: {e}")
-
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-def run() -> None:
-    from email_template import build_email
-
-    check_env()  # ← fails loud + clear if anything missing
-
-    log.info("=" * 55)
-    log.info(f"CodeCelix Email Automation — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    log.info("=" * 55)
-
-    candidates   = fetch_shortlisted()
-    sent, failed = 0, 0
-
-    for c in candidates:
-        log.info(f"Processing: {c.get('name', '?')}")
-        try:
-            feedback      = generate_ai_feedback(c)
-            ai_html       = render_feedback_html(feedback)
-            subject, html = build_email(c, ai_html)
-            success       = send_email(c["email"], subject, html)
-            if success:
-                mark_sent(c["id"])
-                sent += 1
-            else:
-                failed += 1
-        except Exception as e:
-            log.error(f"  ✗ Skipped {c.get('name', '?')}: {e}")
-            failed += 1
-
-    log.info(f"Done. Sent: {sent}  Failed: {failed}")
-    log.info("=" * 55)
-
-
-if __name__ == "__main__":
-    run()
+    return {"status": "submitted", "application_id": app_id}
